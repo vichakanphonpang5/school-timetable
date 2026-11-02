@@ -362,6 +362,15 @@ function teacherMap() { var m = {}; teachers().forEach(function (t) { m[t.id] = 
 function roomsOf(s) { return ROOMS.map(function (k) { return s[k] || ''; }); }
 function assignedCount(s) { return roomsOf(s).filter(Boolean).length; }
 function perRoom(s) { return num(s.unit * 2); }
+/** ห้องที่เรียนวิชานี้จริง: ปกติคือ /1../จำนวนห้อง แต่ถ้ามีครูอยู่ห้องเกินจำนวนนั้น (เช่น 1 ห้อง ครูอยู่ /2 = เรียนเฉพาะ /2) ให้ยึดห้องที่มีครู */
+function realRooms(s) {
+  var n = Math.min(s.rooms, 3), base = [], over = false;
+  for (var r = 1; r <= 3; r++) {
+    if (r <= n) base.push(r);
+    else if (s['room' + r]) over = true;
+  }
+  return over ? [1, 2, 3].filter(function (x) { return s['room' + x]; }) : base;
+}
 /** ห้องที่ติ๊กเรียนรวม (ต้อง 2 ห้องขึ้นไปจึงนับ) */
 function combinedRooms(s) {
   var c = String(s.combine || '').split(',').map(Number).filter(function (r, i, a) { return r >= 1 && r <= Math.min(s.rooms, 3) && a.indexOf(r) === i; });
@@ -372,13 +381,12 @@ function groupOf(s, room) { var c = combinedRooms(s); return c.indexOf(room) >= 
 /** กลุ่มการสอนของวิชา: ห้องที่เรียนรวมนับเป็นกลุ่มเดียว (ครูสอนครั้งเดียว) */
 function teachGroups(s) {
   var out = [], done = {};
-  for (var r = 1; r <= 3; r++) {
-    // ห้องเกินจำนวนห้องของวิชาแต่มีครู ยังนับ (ภาพรวมจะเตือนว่ากำหนดครูเกิน)
-    if (done[r] || (r > s.rooms && !s['room' + r])) continue;
+  realRooms(s).forEach(function (r) {
+    if (done[r]) return;
     var g = groupOf(s, r);
     g.forEach(function (x) { done[x] = 1; });
     out.push({ rooms: g, tid: s['room' + g[0]] || '', combined: g.length > 1 });
-  }
+  });
   return out;
 }
 function totalPeriods(s) { return num(teachGroups(s).length * s.unit * 2); }
@@ -651,7 +659,7 @@ function replaceTeacher(row) {
 /* ------------------------------------------------------------ จัดตาราง */
 function classes() {
   var max = {}, out = [];
-  subjects().forEach(function (s) { max[s.level] = Math.max(max[s.level] || 0, Math.min(s.rooms, 3)); });
+  subjects().forEach(function (s) { max[s.level] = Math.max.apply(null, [max[s.level] || 0].concat(realRooms(s))); });
   Object.keys(max).map(Number).sort(function (a, b) { return a - b; }).forEach(function (l) {
     for (var r = 1; r <= max[l]; r++) out.push({ level: l, room: r, key: l + '/' + r });
   });
@@ -678,7 +686,7 @@ function ttIndex() {
     var k = s.id + '#' + l.room;
     ix.count[k] = (ix.count[k] || 0) + 1;
     if (outside(l, sch)) return ix.orphans.push({ l: l, s: s, why: 'อยู่นอกวัน/คาบที่ตั้งไว้ (' + (DAY_NAMES[l.day] || '?') + ' คาบ ' + l.period + ')' });
-    if (l.room > s.rooms) ix.orphans.push({ l: l, s: s, why: 'วิชานี้ตั้งไว้ ' + s.rooms + ' ห้อง แต่ลงตารางห้อง /' + l.room });
+    if (realRooms(s).indexOf(l.room) < 0) ix.orphans.push({ l: l, s: s, why: 'วิชานี้ตั้งไว้ ' + s.rooms + ' ห้อง แต่ลงตารางห้อง /' + l.room });
     var g = groupOf(s, l.room);
     // ev = การสอนหนึ่งครั้ง: ห้องที่เรียนรวมในช่องเดียวกันนับเป็นครั้งเดียว (ไม่ถือว่าครูสอนซ้อน)
     var info = { l: l, s: s, level: s.level, room: l.room, tid: teacherOf(s, l.room), ev: g.length > 1 ? s.id + '#' + g.join('+') : l.id };
@@ -736,11 +744,11 @@ function ttNeeds(ix) {
   if (S.ttMode === 'teacher') {
     // ห้องที่เรียนรวมแสดงเป็นรายการเดียว
     subjects().forEach(function (s) {
-      teachGroups(s).forEach(function (g) { if (g.tid === S.ttTeacher && g.rooms[0] <= Math.min(s.rooms, 3)) out.push({ s: s, room: g.rooms[0] }); });
+      teachGroups(s).forEach(function (g) { if (g.tid === S.ttTeacher) out.push({ s: s, room: g.rooms[0] }); });
     });
   } else {
     var c = S.ttClass.split('/').map(Number);
-    subjects().forEach(function (s) { if (s.level === c[0] && s.rooms >= c[1]) out.push({ s: s, room: c[1] }); });
+    subjects().forEach(function (s) { if (s.level === c[0] && realRooms(s).indexOf(c[1]) >= 0) out.push({ s: s, room: c[1] }); });
   }
   out.forEach(function (n) {
     n.need = needPeriods(n.s); n.placed = ix.count[n.s.id + '#' + n.room] || 0; n.tid = teacherOf(n.s, n.room);
@@ -804,7 +812,7 @@ function viewTimetable(v) {
   var needs = ttNeeds(ix), probs = ttProblems(ix);
   var totNeed = 0, totPlaced = 0;
   subjects().forEach(function (s) {
-    for (var r = 1; r <= Math.min(s.rooms, 3); r++) { totNeed += needPeriods(s); totPlaced += Math.min(ix.count[s.id + '#' + r] || 0, needPeriods(s)); }
+    realRooms(s).forEach(function (r) { totNeed += needPeriods(s); totPlaced += Math.min(ix.count[s.id + '#' + r] || 0, needPeriods(s)); });
   });
   var myNeed = needs.reduce(function (a, n) { return a + n.need; }, 0), myPlaced = needs.reduce(function (a, n) { return a + Math.min(n.placed, n.need); }, 0);
   var pageLs = pageLessons(ix);
@@ -1070,7 +1078,6 @@ function autoPlan(opts) {
   var units = [], skipped = [];
   subjects().forEach(function (s) {
     teachGroups(s).forEach(function (g) {
-      if (g.rooms[0] > Math.min(s.rooms, 3)) return;
       var clsList = g.rooms.map(function (r) { return s.level + '/' + r; });
       if (opts.scope === 'class' && clsList.indexOf(S.ttClass) < 0) return;
       if (opts.scope === 'teacher' && g.tid !== S.ttTeacher) return;
@@ -1230,7 +1237,7 @@ function autoPlan(opts) {
   // ห้องที่มีคาบต้องเรียนมากกว่าช่องที่มี — จัดยังไงก็ไม่ครบ ต้องแก้ข้อมูลที่แท็บมอบหมายครู/รายวิชา
   best.overfull = cls.filter(function (c) { return best.unplaced.some(function (u) { return u.clsList.indexOf(c.key) >= 0; }); }).map(function (c) {
     var need = 0, cap = 0;
-    subjects().forEach(function (s) { if (s.level === c.level && s.rooms >= c.room) need += needPeriods(s); });
+    subjects().forEach(function (s) { if (s.level === c.level && realRooms(s).indexOf(c.room) >= 0) need += needPeriods(s); });
     days.forEach(function (day) { for (var p = 1; p <= nP; p++) if (!base.fixedC[c.key + '@' + slotKey(day, p)]) cap++; });
     return { key: c.key, need: need, cap: cap };
   }).filter(function (o) { return o.need > o.cap; });
