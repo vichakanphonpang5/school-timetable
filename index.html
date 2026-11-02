@@ -919,9 +919,13 @@ function render() {
   if ($('unlockBtn')) $('unlockBtn').onclick = unlockForm;
   if ($('lockBtn')) $('lockBtn').onclick = lockEdit;
 
-  var nProb = problems().filter(function (p) { return p.kind !== 'info'; }).length;
+  // โหมดดูอย่างเดียวเห็นเฉพาะเมนูเหล่านี้
+  var viewTabs = ['overview', 'print', 'vcr02'];
+  if (!d.canEdit && viewTabs.indexOf(S.tab) < 0) S.tab = 'overview';
+  var nProb = d.canEdit ? problems().filter(function (p) { return p.kind !== 'info'; }).length : 0;
   var nTT = ttProblems(ttIndex()).length;
   Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), function (b) {
+    b.hidden = !d.canEdit && viewTabs.indexOf(b.dataset.tab) < 0;
     b.classList.toggle('active', b.dataset.tab === S.tab);
     if (b.dataset.tab === 'overview') b.innerHTML = 'ภาพรวม' + (nProb ? '<span class="count">' + nProb + '</span>' : '');
     if (b.dataset.tab === 'timetable') b.innerHTML = 'จัดตาราง' + (nTT ? '<span class="count">' + nTT + '</span>' : '');
@@ -952,14 +956,16 @@ function viewOverview(v) {
     stat(num(assigned) + ' / ' + num(total), 'คาบที่มีครูสอน / คาบทั้งหมด', assigned === total ? 'ok' : 'bad') +
     stat(ts.length, 'ครู') + '</div>';
 
-  html += '<div class="panel"><h2>สิ่งที่ต้องตรวจสอบ</h2>';
-  if (!probs.length) html += '<p class="status-ok">✓ ข้อมูลครบถ้วน ไม่มีรายการที่ต้องแก้</p>';
-  else html += '<ul class="warn-list">' + probs.map(function (p) {
-    if (p.s) return '<li class="' + p.kind + '"><b>' + esc(p.s.code) + '</b> ' + esc(p.s.name) + ' (ม.' + p.s.level + ') — ' + esc(p.text) +
-      ' <a data-goto="' + esc(p.s.id) + '">ไปที่วิชานี้</a></li>';
-    return '<li class="info"><b>' + esc(fullName(p.t)) + '</b> — ' + esc(p.text) + '</li>';
-  }).join('') + '</ul>';
-  html += '</div>';
+  if (S.data.canEdit) {
+    html += '<div class="panel"><h2>สิ่งที่ต้องตรวจสอบ</h2>';
+    if (!probs.length) html += '<p class="status-ok">✓ ข้อมูลครบถ้วน ไม่มีรายการที่ต้องแก้</p>';
+    else html += '<ul class="warn-list">' + probs.map(function (p) {
+      if (p.s) return '<li class="' + p.kind + '"><b>' + esc(p.s.code) + '</b> ' + esc(p.s.name) + ' (ม.' + p.s.level + ') — ' + esc(p.text) +
+        ' <a data-goto="' + esc(p.s.id) + '">ไปที่วิชานี้</a></li>';
+      return '<li class="info"><b>' + esc(fullName(p.t)) + '</b> — ' + esc(p.text) + '</li>';
+    }).join('') + '</ul>';
+    html += '</div>';
+  }
 
   html += '<div class="panel"><h2>ภาระการสอนของครู (คาบ/สัปดาห์)</h2><div class="scroll"><table><thead><tr>' +
     '<th class="num">ที่</th><th>ชื่อครู</th><th class="num">จำนวนวิชา</th><th class="num">คาบรวม</th><th style="width:40%"></th></tr></thead><tbody>' +
@@ -1941,14 +1947,14 @@ function viewPrint(v) {
     '<select id="prLayout"><option value="portrait">2 ตารางต่อหน้า (A4 แนวตั้ง)</option><option value="landscape"' + (land ? ' selected' : '') + '>1 ตารางต่อหน้า (A4 แนวนอน)</option></select>' +
     '<span class="spacer"></span><span class="muted">' + pages.length + ' หน้า</span><button class="btn primary" onclick="window.print()">🖨 พิมพ์ / PDF</button></div>' +
     '<p class="muted" style="margin:0">ตอนพิมพ์: เลือกกระดาษ A4 และตั้งระยะขอบ (Margins) เป็น "ไม่มี / None" — ปิด "ส่วนหัวและท้ายกระดาษ" ด้วย</p></div>';
-  html += printSettingsHtml();
+  if (S.data.canEdit) html += printSettingsHtml();
   html += '<div class="pr-pages">' + (pages.join('') || '<p class="muted">ไม่มีข้อมูล</p>') + '</div>';
   v.innerHTML = html;
 
   each(v, '[data-prmode]', function (b) { b.onclick = function () { S.prMode = b.dataset.prmode; S.prWho = 'all'; store('prMode', S.prMode); render(); }; });
   $('prWho').onchange = function () { S.prWho = this.value; render(); };
   $('prLayout').onchange = function () { S.prLayout = this.value; store('prLayout', S.prLayout); render(); };
-  bindPrintSettings(v);
+  if (S.data.canEdit) bindPrintSettings(v);
   // ถ้าตารางยาวเกินครึ่งหน้า (เช่น เรียน 6–7 วัน หรือวิชาเยอะ) ค่อยๆ ลดขนาดตัวอักษรจนพอดี
   each(v, '.sheet', function (sh) {
     var pt = land ? 10.5 : 9;
