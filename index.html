@@ -1,7 +1,422 @@
 <!DOCTYPE html>
 <html lang="th">
 <head>
-<base target="_top">
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<script>
+window.SEED = { schoolName: '', terms: [], teachers: [], subjects: [], defaultSchedule: {
+    days: [1, 2, 3, 4, 5],
+    periods: [
+      { type: 'class', label: '', start: '08:30', end: '09:20' },
+      { type: 'class', label: '', start: '09:20', end: '10:10' },
+      { type: 'class', label: '', start: '10:10', end: '11:00' },
+      { type: 'class', label: '', start: '11:00', end: '11:50' },
+      { type: 'break', label: 'พักกลางวัน', start: '11:50', end: '12:50' },
+      { type: 'class', label: '', start: '12:50', end: '13:40' },
+      { type: 'class', label: '', start: '13:40', end: '14:30' },
+      { type: 'class', label: '', start: '14:30', end: '15:20' },
+      { type: 'class', label: '', start: '15:20', end: '16:10' }
+    ]
+  } };
+var EDITOR_EMAIL = 'vichaphonpang@gmail.com';
+// ค่าเชื่อมต่อ Firebase ของเว็บแอป (ไม่ใช่ความลับ — สิทธิ์จริงคุมด้วย Firestore Security Rules และ Firebase Auth)
+var FIREBASE_CONFIG = {
+  apiKey: 'AIzaSyCXBmD6LzGc7hEF1ra5L7KXxL3ZmfpkJyo',
+  authDomain: 'school-timetable-da107.firebaseapp.com',
+  projectId: 'school-timetable-da107',
+  storageBucket: 'school-timetable-da107.firebasestorage.app',
+  messagingSenderId: '49586739723',
+  appId: '1:49586739723:web:03d70ad00861ab38c7c50e'
+};
+
+</script>
+<script>
+// Local stand-in for google.script.run, backed by SEED.
+//   - dev preview (serve.ps1): data lives in memory and resets on reload
+//   - offline desktop build (build-offline.ps1 sets window.OFFLINE = true): data is saved in localStorage
+// Keep the rules here in step with Code.gs (placeLesson, importAll, …).
+(function () {
+  var KEY = 'school-timetable-db-v1';
+  var mockToken = '';
+  function locked() { return !window.OFFLINE && /locked/.test(location.hash); }
+  var now = function () { return new Date().toISOString(); };
+  var copy = function (o) { return JSON.parse(JSON.stringify(o)); };
+  var rid = function (p) { return p + '-' + Math.random().toString(16).slice(2, 10); };
+
+  function seedDb() {
+    return {
+      school: SEED.schoolName,
+      terms: SEED.terms.map(function (r) { return { id: r[0], label: r[1], order: r[2] }; }),
+      teachers: SEED.teachers.map(function (r) {
+        return { id: r[0], termId: r[1], order: r[2], prefix: r[3], firstName: r[4], lastName: r[5], homeroom: r[6], updatedAt: '2026-01-01T00:00:00.000Z' };
+      }),
+      subjects: SEED.subjects.map(function (r) {
+        return { id: r[0], termId: r[1], order: r[2], code: r[3], name: r[4], unit: r[5], level: r[6], rooms: r[7], note: r[8],
+          room1: r[9], room2: r[10], room3: r[11], combine: '', tags: '', updatedAt: '2026-01-01T00:00:00.000Z' };
+      }),
+      schedules: {},
+      print: {},
+      fixed: [],
+      timetable: []
+    };
+  }
+
+  function load() {
+    if (!window.OFFLINE) return seedDb();
+    try {
+      var saved = JSON.parse(localStorage.getItem(KEY));
+      if (saved && saved.terms) {
+        ['schedules', 'print'].forEach(function (k) { saved[k] = saved[k] || {}; });
+        ['fixed', 'timetable'].forEach(function (k) { saved[k] = saved[k] || []; });
+        saved.subjects.forEach(function (s) { s.combine = s.combine || ''; s.tags = s.tags || ''; });
+        return saved;
+      }
+    } catch (e) { /* ใช้ข้อมูลตั้งต้น */ }
+    return seedDb();
+  }
+  var db = load();
+
+  function save() {
+    if (!window.OFFLINE) return;
+    try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { throw new Error('บันทึกลงเครื่องไม่สำเร็จ (' + e.message + ')'); }
+  }
+
+  function findSubject(id) { return db.subjects.filter(function (x) { return x.id === id; })[0]; }
+  function scheduleOf(termId) { return db.schedules[termId] || SEED.defaultSchedule; }
+
+  var api = {
+    getData: function () {
+      var schedules = {};
+      db.terms.forEach(function (t) { schedules[t.id] = scheduleOf(t.id); });
+      return { school: db.school, terms: copy(db.terms), teachers: copy(db.teachers), subjects: copy(db.subjects),
+        schedules: copy(schedules), print: copy(db.print), fixed: copy(db.fixed), timetable: copy(db.timetable),
+        user: window.OFFLINE ? 'ใช้งานในเครื่องนี้' : locked() ? '' : 'preview@example.com',
+        canEdit: !/readonly/.test(location.hash) && (!locked() || mockToken === 'preview-token'), sheetUrl: locked() && mockToken !== 'preview-token' ? '' : '#', offline: !!window.OFFLINE };
+    },
+    saveRooms: function (id, rooms, exp, combine) {
+      var s = findSubject(id);
+      if (exp && s.updatedAt !== exp) return { conflict: true, row: copy(s) };
+      s.room1 = rooms[0] || ''; s.room2 = rooms[1] || ''; s.room3 = rooms[2] || '';
+      if (combine !== undefined && combine !== null) {
+        var c = String(combine).split(',').map(Number).filter(function (r, i, a) { return r >= 1 && r <= 3 && a.indexOf(r) === i; }).sort();
+        s.combine = c.join(',');
+        if (c.length >= 2) {
+          var tid = c.map(function (r) { return s['room' + r]; }).filter(String)[0] || '';
+          c.forEach(function (r) { s['room' + r] = tid; });
+        }
+      }
+      s.updatedAt = now();
+      return { conflict: false, row: copy(s) };
+    },
+    saveTags: function (id, tags) {
+      var s = findSubject(id);
+      s.tags = tags.filter(function (t) { return ['morning', 'double', 'pe', 'agri'].indexOf(t) >= 0; }).join(',');
+      s.updatedAt = now();
+      return { conflict: false, row: copy(s) };
+    },
+    saveSubject: function (o, exp) {
+      var s = o.id ? findSubject(o.id) : null;
+      if (s && exp && s.updatedAt !== exp) return { conflict: true, row: copy(s) };
+      if (!s) { s = { id: rid('S'), room1: '', room2: '', room3: '', combine: '', tags: '' }; db.subjects.push(s); }
+      ['termId', 'code', 'name', 'note'].forEach(function (k) { s[k] = String(o[k]); });
+      ['order', 'unit', 'level', 'rooms'].forEach(function (k) { s[k] = Number(o[k]); });
+      s.updatedAt = now();
+      return { conflict: false, row: copy(s) };
+    },
+    deleteSubject: function (id) {
+      db.subjects = db.subjects.filter(function (x) { return x.id !== id; });
+      var before = db.timetable.length;
+      db.timetable = db.timetable.filter(function (l) { return l.subjectId !== id; });
+      return { ok: true, lessons: before - db.timetable.length };
+    },
+    saveTeacher: function (o, exp) {
+      var t = o.id ? db.teachers.filter(function (x) { return x.id === o.id; })[0] : null;
+      if (t && exp && t.updatedAt !== exp) return { conflict: true, row: copy(t) };
+      if (!t) { t = { id: rid('T') }; db.teachers.push(t); }
+      ['termId', 'prefix', 'firstName', 'lastName', 'homeroom'].forEach(function (k) { t[k] = String(o[k]); });
+      t.order = Number(o.order); t.updatedAt = now();
+      return { conflict: false, row: copy(t) };
+    },
+    deleteTeacher: function (id) {
+      var cleared = [];
+      db.subjects.forEach(function (s) { ['room1', 'room2', 'room3'].forEach(function (k) { if (s[k] === id) { s[k] = ''; cleared.push(s.id); } }); });
+      db.teachers = db.teachers.filter(function (x) { return x.id !== id; });
+      return { ok: true, cleared: cleared };
+    },
+    createTerm: function (o) {
+      if (db.terms.some(function (t) { return t.id === o.id; })) throw new Error('มีภาคเรียน ' + o.id + ' อยู่แล้ว');
+      db.terms.push({ id: o.id, label: o.label, order: db.terms.length + 1 });
+      var map = {}, nt = 0, ns = 0;
+      db.teachers.filter(function (t) { return t.termId === o.copyFrom; }).forEach(function (t) {
+        var n = copy(t); n.id = rid('T'); n.termId = o.id; map[t.id] = n.id; db.teachers.push(n); nt++;
+      });
+      db.subjects.filter(function (s) { return s.termId === o.copyFrom; }).forEach(function (s) {
+        var n = copy(s); n.id = rid('S'); n.termId = o.id;
+        ['room1', 'room2', 'room3'].forEach(function (k) { n[k] = o.copyAssign ? (map[s[k]] || '') : ''; });
+        db.subjects.push(n); ns++;
+      });
+      if (o.copyFrom) {
+        if (db.schedules[o.copyFrom]) db.schedules[o.id] = copy(db.schedules[o.copyFrom]);
+        db.fixed.filter(function (f) { return f.termId === o.copyFrom; }).forEach(function (f) {
+          var n = copy(f); n.id = rid('F'); n.termId = o.id; db.fixed.push(n);
+        });
+      }
+      return { ok: true, teachers: nt, subjects: ns };
+    },
+    renameTerm: function (id, label) { db.terms.filter(function (t) { return t.id === id; })[0].label = label; return { ok: true }; },
+    saveSchoolName: function (n) { db.school = n; return { ok: true }; },
+    exportReport: function (name, title, header, rows) { window.__lastExport = { name: name, title: title, header: header, rows: rows }; return { url: 'about:blank' }; },
+
+    saveSchedule: function (termId, s) {
+      if (!s.days.length) throw new Error('ต้องเลือกวันเรียนอย่างน้อย 1 วัน');
+      db.schedules[termId] = copy(s);
+      return { ok: true, schedule: copy(s) };
+    },
+    saveFixed: function (f) {
+      var rows = [], skipped = 0;
+      f.days.forEach(function (day) {
+        var dup = db.fixed.some(function (x) { return x.termId === f.termId && x.day === day && x.period === f.period && x.level === f.level && x.room === f.room; });
+        if (dup) { skipped++; return; }
+        var row = { id: rid('F'), termId: f.termId, day: day, period: f.period, level: f.level, room: f.room, label: f.label, updatedAt: now() };
+        db.fixed.push(row); rows.push(copy(row));
+      });
+      return { rows: rows, skipped: skipped };
+    },
+    deleteFixed: function (id) { db.fixed = db.fixed.filter(function (x) { return x.id !== id; }); return { ok: true }; },
+
+    placeLesson: function (l) {
+      var subj = findSubject(l.subjectId);
+      if (!subj || subj.termId !== l.termId) throw new Error('ไม่พบรายวิชานี้ (อาจถูกลบไปแล้ว)');
+      var sched = scheduleOf(l.termId);
+      var nClass = sched.periods.filter(function (p) { return p.type === 'class'; }).length;
+      if (sched.days.indexOf(l.day) < 0 || !(l.period >= 1 && l.period <= nClass)) throw new Error('ช่องนี้อยู่นอกวัน/คาบเรียนที่ตั้งไว้');
+      var fx = db.fixed.filter(function (f) {
+        return f.termId === l.termId && f.day === l.day && f.period === l.period && (!f.level || (f.level === subj.level && (!f.room || f.room === l.room)));
+      })[0];
+      if (fx) throw new Error('ช่องนี้ล็อกไว้สำหรับ ' + fx.label);
+      var taken = db.timetable.filter(function (x) {
+        var s = findSubject(x.subjectId);
+        return x.id !== l.id && x.termId === l.termId && x.day === l.day && x.period === l.period && x.room === l.room && s && s.level === subj.level;
+      })[0];
+      if (taken) throw new Error('ม.' + subj.level + '/' + l.room + ' มีวิชา ' + findSubject(taken.subjectId).code + ' ในช่องนี้แล้ว');
+      var row;
+      if (l.id) {
+        row = db.timetable.filter(function (x) { return x.id === l.id; })[0];
+        if (!row) throw new Error('ไม่พบคาบนี้ (อาจถูกลบไปแล้ว)');
+        row.day = l.day; row.period = l.period; row.updatedAt = now();
+      } else {
+        row = { id: rid('L'), termId: l.termId, subjectId: subj.id, room: l.room, day: l.day, period: l.period, place: '', updatedAt: now() };
+        db.timetable.push(row);
+      }
+      return { row: copy(row) };
+    },
+    removeLesson: function (id) { db.timetable = db.timetable.filter(function (x) { return x.id !== id; }); return { ok: true }; },
+    placeLessons: function (termId, list) {
+      // ถ้าคาบไหนวางไม่ได้ runner จะคืนข้อมูลเดิมทั้งหมด (เหมือน Code.gs ที่ไม่บันทึกเลย)
+      return { rows: list.map(function (l) {
+        var row = api.placeLesson({ termId: termId, subjectId: l.subjectId, room: l.room, day: l.day, period: l.period });
+        var saved = db.timetable.filter(function (x) { return x.id === row.row.id; })[0];
+        saved.place = String(l.place || '');
+        return copy(saved);
+      }) };
+    },
+    removeLessons: function (ids) {
+      var before = db.timetable.length;
+      db.timetable = db.timetable.filter(function (x) { return ids.indexOf(x.id) < 0; });
+      return { ok: true, removed: before - db.timetable.length };
+    },
+    setPlace: function (termId, subjectId, room, place) {
+      var ids = [];
+      place = String(place || '').trim();
+      db.timetable.forEach(function (l) {
+        if (l.termId === termId && l.subjectId === subjectId && l.room === room) { l.place = place; ids.push(l.id); }
+      });
+      return { ids: ids, place: place };
+    },
+    savePrintSettings: function (p) {
+      if (JSON.stringify(p).length > 45000) throw new Error('รูปโลโก้ใหญ่เกินไป — ลองใช้รูปที่เล็กลง');
+      db.print = copy(p);
+      return { ok: true, print: copy(p) };
+    },
+
+    importAll: function (p) {
+      if (!p || p.app !== 'school-timetable' || !p.terms || !p.teachers || !p.subjects) throw new Error('ไฟล์นี้ไม่ใช่ไฟล์สำรองของระบบนี้');
+      db = { school: p.school || '', terms: p.terms, teachers: p.teachers, subjects: p.subjects,
+        schedules: p.schedules || {}, print: p.print || {}, fixed: p.fixed || [], timetable: p.timetable || [] };
+      return { ok: true };
+    },
+    resetAll: function () { db = seedDb(); return { ok: true }; },
+    // เหมือน rpc/unlock ใน Code.gs: เปิดพรีวิวด้วย #locked เพื่อทดสอบรหัสผ่าน (รหัส = preview)
+    unlock: function (pw) {
+      if (pw !== 'preview') throw new Error('รหัสผ่านไม่ถูกต้อง');
+      return { token: 'preview-token' };
+    },
+    rpc: function (name, args, token) {
+      mockToken = token;
+      if (locked() && name !== 'getData' && token !== 'preview-token') throw new Error('ไม่มีสิทธิ์แก้ไข — กด "เข้าโหมดแก้ไข" แล้วใส่รหัสผ่าน');
+      return api[name].apply(null, args || []);
+    }
+  };
+
+  var READ_ONLY = { getData: 1, exportReport: 1 };
+  function runner(ok, fail) {
+    var r = {
+      withSuccessHandler: function (f) { return runner(f, fail); },
+      withFailureHandler: function (f) { return runner(ok, f); }
+    };
+    Object.keys(api).forEach(function (k) {
+      r[k] = function () {
+        var args = copy(Array.prototype.slice.call(arguments));
+        setTimeout(function () {
+          var backup = JSON.stringify(db);
+          try {
+            var v = api[k].apply(null, args);
+            if (!READ_ONLY[k]) save();
+            ok && ok(copy(v));
+          } catch (e) {
+            db = JSON.parse(backup);
+            fail && fail(e);
+          }
+        }, window.OFFLINE ? 0 : 150);
+      };
+    });
+    return r;
+  }
+  window.google = { script: { get run() { return runner(null, null); } } };
+  // ให้ firebase-backend.js ใช้กฎชุดนี้กับข้อมูลจาก Firestore
+  window.__backend = { api: api, getDb: function () { return db; }, setDb: function (d) { db = d; } };
+})();
+
+</script>
+<script>
+// ฐานข้อมูล Firestore สำหรับหน้าเว็บบน GitHub Pages: แทน google.script.run โดยใช้กฎการแก้ข้อมูลชุดเดียวกับ mock.js
+// โครงสร้าง (เก็บเป็นสตริง JSON ในฟิลด์ json เอกสารละไม่เกิน 1 MB):
+//   app/main          = { school, terms, schedules, print, lastBackup }
+//   terms/<termId>    = { teachers, subjects, fixed, timetable } ของภาคเรียนนั้น
+//   app/rev           = { rev, by } เปลี่ยนทุกครั้งที่บันทึก เพื่อแจ้งเครื่องอื่นให้โหลดใหม่
+//   logs/<auto>       = ประวัติการแก้ไข
+//   backups/d01..d31  = สำรองอัตโนมัติวันละครั้ง (เขียนทับวันเดียวกันของเดือนถัดไป)
+(function () {
+  var backend = window.__backend;
+  firebase.initializeApp(FIREBASE_CONFIG);
+  var fs = firebase.firestore(), auth = firebase.auth();
+  var CLIENT = Math.random().toString(16).slice(2);
+  var TERM_KEYS = ['teachers', 'subjects', 'fixed', 'timetable'];
+
+  var mainRef = fs.collection('app').doc('main'), revRef = fs.collection('app').doc('rev');
+  function termRef(id) { return fs.collection('terms').doc(String(id)); }
+  function parse(snap) { return snap.exists ? JSON.parse(snap.data().json) : null; }
+
+  var authReady = new Promise(function (resolve) {
+    var done = auth.onAuthStateChanged(function () { done(); resolve(); });
+  });
+  function canEdit() { return !!(auth.currentUser && auth.currentUser.email === EDITOR_EMAIL); }
+
+  function emptyDb() { return { school: '', terms: [], schedules: {}, print: {}, teachers: [], subjects: [], fixed: [], timetable: [] }; }
+  /** รวมเอกสารหลักกับเอกสารภาคเรียน เป็นก้อน db ที่กฎใน mock.js ใช้ */
+  function assemble(main, termDocs) {
+    var db = emptyDb();
+    if (!main) return db;
+    db.school = main.school || ''; db.terms = main.terms || []; db.schedules = main.schedules || {}; db.print = main.print || {};
+    termDocs.forEach(function (t) { if (t) TERM_KEYS.forEach(function (k) { db[k] = db[k].concat(t[k] || []); }); });
+    return db;
+  }
+  /** แยก db กลับเป็นสตริงของแต่ละเอกสาร เพื่อเขียนเฉพาะเอกสารที่เปลี่ยน */
+  function split(db, lastBackup) {
+    var out = { main: JSON.stringify({ school: db.school, terms: db.terms, schedules: db.schedules, print: db.print, lastBackup: lastBackup || '' }), terms: {} };
+    db.terms.forEach(function (t) {
+      var part = {};
+      TERM_KEYS.forEach(function (k) { part[k] = db[k].filter(function (x) { return String(x.termId) === String(t.id); }); });
+      out.terms[t.id] = JSON.stringify(part);
+    });
+    return out;
+  }
+
+  function getData() {
+    return authReady.then(function () { return mainRef.get(); }).then(function (mainSnap) {
+      var main = parse(mainSnap);
+      return Promise.all(((main && main.terms) || []).map(function (t) { return termRef(t.id).get(); })).then(function (snaps) {
+        backend.setDb(assemble(main, snaps.map(parse)));
+        var d = backend.api.getData();
+        d.user = ''; d.canEdit = canEdit(); d.sheetUrl = ''; d.offline = false; d.firebase = true; d.empty = !main;
+        return d;
+      });
+    });
+  }
+
+  /** คำสั่งแก้ข้อมูล: อ่านล่าสุดใน transaction > ใช้กฎเดิม > เขียนเฉพาะเอกสารที่เปลี่ยน (พลาดจุดไหนก็ไม่บันทึกเลย) */
+  function write(name, args) {
+    if (!canEdit()) return Promise.reject(new Error('ไม่มีสิทธิ์แก้ไข — กด "เข้าโหมดแก้ไข" แล้วใส่รหัสผ่าน'));
+    return fs.runTransaction(function (tx) {
+      return tx.get(mainRef).then(function (mainSnap) {
+        var main = parse(mainSnap);
+        var ids = ((main && main.terms) || []).map(function (t) { return t.id; });
+        return Promise.all(ids.map(function (id) { return tx.get(termRef(id)); })).then(function (snaps) {
+          var termDocs = snaps.map(parse), before = assemble(main, termDocs);
+          var today = new Date().toISOString().slice(0, 10), lastBackup = (main && main.lastBackup) || '';
+          var oldParts = split(before, lastBackup);
+          // สำรองก่อนแก้ครั้งแรกของวัน
+          if (main && lastBackup !== today) {
+            tx.set(fs.collection('backups').doc('d' + today.slice(8)), { at: new Date().toISOString(), json: JSON.stringify(before) });
+            lastBackup = today;
+          }
+          backend.setDb(JSON.parse(JSON.stringify(before)));
+          var result = backend.api[name].apply(null, args);
+          var parts = split(backend.getDb(), lastBackup);
+          if (parts.main !== oldParts.main || !main) tx.set(mainRef, { json: parts.main });
+          Object.keys(parts.terms).forEach(function (id) {
+            if (parts.terms[id] !== oldParts.terms[id]) tx.set(termRef(id), { json: parts.terms[id] });
+          });
+          // ภาคเรียนที่ไม่อยู่แล้ว (จากการนำเข้าไฟล์สำรอง)
+          ids.forEach(function (id) { if (!(id in parts.terms)) tx.delete(termRef(id)); });
+          tx.set(revRef, { rev: Date.now(), by: CLIENT });
+          tx.set(fs.collection('logs').doc(), { at: new Date().toISOString(), action: name, detail: name === 'importAll' ? '' : JSON.stringify(args).slice(0, 500) });
+          return result;
+        });
+      });
+    });
+  }
+
+  function unlock(password) {
+    return auth.setPersistence(firebase.auth.Auth.Persistence.SESSION).then(function () {
+      return auth.signInWithEmailAndPassword(EDITOR_EMAIL, String(password));
+    }).then(function () {
+      return { token: 'firebase' };
+    }).catch(function (e) {
+      var c = e && e.code;
+      if (c === 'auth/too-many-requests') throw new Error('ใส่รหัสผิดหลายครั้งเกินไป รอสักครู่แล้วลองใหม่');
+      if (c === 'auth/invalid-credential' || c === 'auth/wrong-password' || c === 'auth/invalid-login-credentials') throw new Error('รหัสผ่านไม่ถูกต้อง');
+      throw e;
+    });
+  }
+  window.fbSignOut = function () { return auth.signOut(); };
+
+  // เครื่องอื่นบันทึก > โหลดข้อมูลใหม่
+  revRef.onSnapshot(function (snap) {
+    var v = snap.data();
+    if (v && v.by !== CLIENT && window.onRemoteChange) window.onRemoteChange();
+  }, function () { /* อ่านไม่ได้ก็ยังกดรีเฟรชเองได้ */ });
+
+  function friendly(e) {
+    if (e && e.code === 'permission-denied') return new Error('Firebase ไม่อนุญาตให้ทำรายการนี้ (ตรวจกฎความปลอดภัยหรือการเข้าโหมดแก้ไข)');
+    return e;
+  }
+  function run(ok, fail) {
+    return {
+      withSuccessHandler: function (f) { return run(f, fail); },
+      withFailureHandler: function (f) { return run(ok, f); },
+      unlock: function (pw) { unlock(pw).then(ok, fail); },
+      rpc: function (name, args) {
+        var job = name === 'getData' ? getData() : write(name, JSON.parse(JSON.stringify(args || [])));
+        job.then(function (v) { ok && ok(JSON.parse(JSON.stringify(v))); }, function (e) { fail && fail(friendly(e)); });
+      }
+    };
+  }
+  window.google = { script: { get run() { return run(null, null); } } };
+})();
+
+</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ระบบจัดครูผู้สอน</title>
@@ -333,7 +748,34 @@ function unlockForm() {
   $('ulPw').onkeydown = function (e) { if (e.key === 'Enter') go(); };
   $('ulPw').focus();
 }
-function lockEdit() { saveToken(''); reload(true); }
+function lockEdit() {
+  saveToken('');
+  (window.fbSignOut ? window.fbSignOut() : Promise.resolve()).then(function () { reload(true); });
+}
+
+/** ดึงข้อมูลทั้งหมดจาก Google Sheet (ผ่าน API_URL) มาแทนที่ข้อมูลใน Firebase */
+function copyFromSheet() {
+  if (!confirm('ดึงข้อมูลล่าสุดจาก Google Sheet มาแทนที่ข้อมูลทั้งหมดใน Firebase?')) return;
+  toast('กำลังดึงข้อมูลจาก Google Sheet…');
+  postApi('getData', []).then(function (d) {
+    return api('importAll', { app: 'school-timetable', school: d.school, terms: d.terms, teachers: d.teachers, subjects: d.subjects,
+      schedules: d.schedules, print: d.print, fixed: d.fixed, timetable: d.timetable }).then(function () { return d; });
+  }).then(function (d) {
+    S.termId = null;
+    return reload().then(function () {
+      var same = S.data.subjects.length === d.subjects.length && S.data.teachers.length === d.teachers.length && S.data.timetable.length === d.timetable.length;
+      toast((same ? 'ย้ายครบ: ' : 'จำนวนไม่ตรง! ') + S.data.subjects.length + ' วิชา · ' + S.data.teachers.length + ' ครู · ' + S.data.timetable.length + ' คาบ', !same);
+    });
+  }).catch(function (e) { toast('ย้ายข้อมูลไม่สำเร็จ: ' + e, true); });
+}
+/** Firebase ยังไม่มีข้อมูล: หน้าสำหรับเข้าโหมดแก้ไขแล้วดึงข้อมูลเข้ามา */
+function emptyFirebaseView() {
+  $('view').innerHTML = '<div class="panel"><h2>ฐานข้อมูล Firebase ยังว่างอยู่</h2><p>ผู้ดูแลต้องเข้าโหมดแก้ไข แล้วดึงข้อมูลจาก Google Sheet เข้ามาครั้งแรก</p>' +
+    '<div class="toolbar">' + (S.data.canEdit ? '<button class="btn primary" id="fbCopy">⬇ ดึงข้อมูลจาก Google Sheet</button><button class="btn" id="lockBtn2">ออกจากโหมดแก้ไข</button>' : '<button class="btn primary" id="unlockBtn2">🔓 เข้าโหมดแก้ไข</button>') + '</div></div>';
+  if ($('fbCopy')) $('fbCopy').onclick = copyFromSheet;
+  if ($('lockBtn2')) $('lockBtn2').onclick = lockEdit;
+  if ($('unlockBtn2')) $('unlockBtn2').onclick = unlockForm;
+}
 
 /* ------------------------------------------------------------ helpers */
 function esc(v) {
@@ -493,7 +935,7 @@ function render() {
   if (!views[S.tab]) S.tab = 'overview';
   views[S.tab](v);
   if (!d.canEdit) Array.prototype.forEach.call(v.querySelectorAll('[data-edit]'), function (el) { el.disabled = true; });
-  if (d.offline) each(v, '.online-only', function (el) { el.remove(); });
+  if (d.offline || d.firebase) each(v, '.online-only', function (el) { el.remove(); });
 }
 
 /* ------------------------------------------------------------ ภาพรวม */
@@ -1852,6 +2294,7 @@ function viewSettings(v) {
     '<div class="toolbar"><button class="btn" id="bkExport">⬇ ส่งออกไฟล์สำรอง</button>' +
     '<button class="btn" data-edit id="bkImportBtn">⬆ นำเข้าไฟล์สำรอง…</button><input type="file" id="bkImport" accept=".json,application/json" hidden>' +
     (d.offline ? '<button class="btn danger" data-edit id="bkReset">รีเซ็ตเป็นข้อมูลตั้งต้น</button>' : '') +
+    (d.firebase ? '<button class="btn" data-edit id="fbCopy">⬇ ดึงข้อมูลล่าสุดจาก Google Sheet</button>' : '') +
     '</div><p class="muted">การนำเข้าจะ<b>แทนที่ข้อมูลทั้งหมด</b>ในระบบนี้ด้วยข้อมูลในไฟล์</p></div>';
   v.innerHTML = html;
   $('saveSchool').onclick = function () {
@@ -1868,6 +2311,7 @@ function viewSettings(v) {
   });
   $('newTerm').onclick = termForm;
   $('bkExport').onclick = exportBackup;
+  if ($('fbCopy')) $('fbCopy').onclick = copyFromSheet;
   $('bkImportBtn').onclick = function () { $('bkImport').click(); };
   $('bkImport').onchange = function () { if (this.files[0]) importBackup(this.files[0]); this.value = ''; };
   if ($('bkReset')) $('bkReset').onclick = function () {
@@ -2172,6 +2616,7 @@ function reload(quiet) {
     S.data = d;
     var ids = d.terms.map(function (t) { return String(t.id); });
     if (ids.indexOf(S.termId) < 0) S.termId = ids.length ? String(d.terms.slice().sort(byOrder)[ids.length - 1].id) : null;
+    if (d.firebase && d.empty) return emptyFirebaseView();
     if (!S.termId) { $('view').innerHTML = '<div class="banner err">ยังไม่มีข้อมูลภาคเรียน — รัน setup() ในหน้า Apps Script ก่อน</div>'; return; }
     render();
   }).catch(function (e) {
@@ -2188,14 +2633,20 @@ each(document, '#tabs button', function (b) {
   b.onclick = function () { S.tab = b.dataset.tab; store('tab', S.tab); render(); window.scrollTo(0, 0); };
 });
 
-// โหลดข้อมูลใหม่ทุก 60 วินาที เพื่อเห็นสิ่งที่คนอื่นแก้ (ข้ามถ้ากำลังพิมพ์/บันทึก/เปิดหน้าต่างอยู่)
-setInterval(function () {
-  if (!S.data || document.hidden || S.pending || $('modalBg').classList.contains('open')) return;
+// โหลดข้อมูลใหม่เพื่อเห็นสิ่งที่คนอื่นแก้ (ข้ามถ้ากำลังพิมพ์/บันทึก/เปิดหน้าต่างอยู่)
+// Sheet: ทุก 60 วินาที · Firebase: เมื่อมีเครื่องอื่นบันทึก (ถ้าติดอยู่จะลองใหม่รอบถัดไป)
+var remoteDirty = false;
+function autoRefresh() {
+  if (!S.data || (S.data.firebase && !remoteDirty)) return;
+  if (document.hidden || S.pending || $('modalBg').classList.contains('open')) return;
   var a = document.activeElement;
   if (a && (a.tagName === 'SELECT' || a.tagName === 'INPUT')) return;
+  remoteDirty = false;
   var y = window.scrollY;
   reload(true).then(function () { window.scrollTo(0, y); });
-}, 60000);
+}
+window.onRemoteChange = function () { remoteDirty = true; autoRefresh(); };
+setInterval(autoRefresh, 60000);
 
 try { S.token = sessionStorage.getItem('editToken') || ''; } catch (e) { S.token = ''; }
 S.termId = store('termId');
