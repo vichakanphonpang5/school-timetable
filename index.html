@@ -888,17 +888,42 @@ function levels() {
   return Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
 }
 
+/** เรื่องที่แจ้งเตือนในกล่อง "สิ่งที่ต้องตรวจสอบ" — ปิด-เปิดได้ที่แท็บตั้งค่า */
+var ALERTS = [
+  { key: 'noTeacher', label: 'ยังไม่มีครูสอน', hint: 'วิชานี้ยังไม่ได้เลือกครูเลย' },
+  { key: 'partial', label: 'กำหนดครูไม่ครบ', hint: 'เลือกครูไม่ครบตามจำนวนห้องของวิชา' },
+  { key: 'unknown', label: 'อ้างถึงครูที่ไม่มีในรายชื่อ', hint: 'วิชานี้ผูกกับรหัสครูที่ไม่อยู่ในรายชื่อภาคเรียนนี้' },
+  { key: 'over', label: 'กำหนดครูเกินจำนวนห้อง', hint: 'จำนวนคาบของครูจะเกิน' },
+  { key: 'noLessons', label: 'ครูที่ยังไม่มีคาบสอน', hint: 'ครูคนนี้ยังไม่ได้สอนวิชาใดเลย' },
+  { key: 'notPlaced', label: 'ครูที่ยังจัดตารางไม่เรียบร้อย', hint: 'ครูที่ยังจัดตารางเรียนไม่ครบตามที่ได้รับมอบหมาย' }
+];
+function alertOn(key) { return printCfg().alerts[key] !== false; }
 function problems() {
   var tm = teacherMap(), out = [];
   subjects().forEach(function (s) {
     var n = assignedCount(s);
-    if (n < s.rooms) out.push({ kind: 'bad', s: s, text: (n === 0 ? 'ยังไม่มีครูสอน' : 'กำหนดครูแล้ว ' + n + ' จาก ' + s.rooms + ' ห้อง') });
-    else if (n > s.rooms) out.push({ kind: 'warn', s: s, text: 'กำหนดครู ' + n + ' ห้อง แต่วิชานี้มี ' + s.rooms + ' ห้อง (จำนวนคาบจะเกิน)' });
-    roomsOf(s).forEach(function (tid) { if (tid && !tm[tid]) out.push({ kind: 'bad', s: s, text: 'อ้างถึงครูที่ไม่มีในรายชื่อ (' + tid + ')' }); });
+    if (n < s.rooms) out.push({ key: n === 0 ? 'noTeacher' : 'partial', kind: 'bad', s: s, text: (n === 0 ? 'ยังไม่มีครูสอน' : 'กำหนดครูแล้ว ' + n + ' จาก ' + s.rooms + ' ห้อง') });
+    else if (n > s.rooms) out.push({ key: 'over', kind: 'warn', s: s, text: 'กำหนดครู ' + n + ' ห้อง แต่วิชานี้มี ' + s.rooms + ' ห้อง (จำนวนคาบจะเกิน)' });
+    roomsOf(s).forEach(function (tid) { if (tid && !tm[tid]) out.push({ key: 'unknown', kind: 'bad', s: s, text: 'อ้างถึงครูที่ไม่มีในรายชื่อ (' + tid + ')' }); });
   });
   var L = loads().periods;
-  teachers().forEach(function (t) { if (!L[t.id]) out.push({ kind: 'info', t: t, text: 'ยังไม่มีคาบสอน' }); });
-  return out;
+  teachers().forEach(function (t) { if (!L[t.id]) out.push({ key: 'noLessons', kind: 'info', t: t, text: 'ยังไม่มีคาบสอน' }); });
+  // คาบที่ลงตารางแล้วเทียบกับที่ได้รับมอบหมาย (ห้องที่เรียนรวมนับครั้งเดียว) — ลงเกินในวิชาหนึ่งไม่ชดเชยอีกวิชา
+  var count = ttIndex().count, need = {}, placed = {};
+  subjects().forEach(function (s) {
+    teachGroups(s).forEach(function (g) {
+      if (!g.tid) return;
+      var n = needPeriods(s);
+      need[g.tid] = (need[g.tid] || 0) + n;
+      placed[g.tid] = (placed[g.tid] || 0) + Math.min(count[s.id + '#' + g.rooms[0]] || 0, n);
+    });
+  });
+  teachers().forEach(function (t) {
+    if (need[t.id] && (placed[t.id] || 0) < need[t.id]) {
+      out.push({ key: 'notPlaced', kind: 'warn', t: t, goTeacher: true, text: 'ครูที่ยังจัดตารางไม่เรียบร้อย (ลงแล้ว ' + (placed[t.id] || 0) + ' จาก ' + need[t.id] + ' คาบ)' });
+    }
+  });
+  return out.filter(function (p) { return alertOn(p.key); });
 }
 
 /* ------------------------------------------------------------ render shell */
@@ -958,12 +983,15 @@ function viewOverview(v) {
 
   if (S.data.canEdit) {
     html += '<div class="panel"><h2>สิ่งที่ต้องตรวจสอบ</h2>';
-    if (!probs.length) html += '<p class="status-ok">✓ ข้อมูลครบถ้วน ไม่มีรายการที่ต้องแก้</p>';
+    var nOff = ALERTS.filter(function (a) { return !alertOn(a.key); }).length;
+    if (!probs.length) html += '<p class="status-ok">✓ ' + (nOff ? 'ไม่มีรายการแจ้งเตือน' : 'ข้อมูลครบถ้วน ไม่มีรายการที่ต้องแก้') + '</p>';
     else html += '<ul class="warn-list">' + probs.map(function (p) {
       if (p.s) return '<li class="' + p.kind + '"><b>' + esc(p.s.code) + '</b> ' + esc(p.s.name) + ' (ม.' + p.s.level + ') — ' + esc(p.text) +
         ' <a data-goto="' + esc(p.s.id) + '">ไปที่วิชานี้</a></li>';
-      return '<li class="info"><b>' + esc(fullName(p.t)) + '</b> — ' + esc(p.text) + '</li>';
+      return '<li class="' + p.kind + '"><b>' + esc(fullName(p.t)) + '</b> — ' + esc(p.text) +
+        (p.goTeacher ? ' <a data-gotchr="' + esc(p.t.id) + '">ไปที่ตารางครู</a>' : '') + '</li>';
     }).join('') + '</ul>';
+    if (nOff) html += '<p class="muted" style="margin-bottom:0">ปิดการแจ้งเตือนไว้ ' + nOff + ' เรื่อง (เปลี่ยนได้ที่แท็บตั้งค่า)</p>';
     html += '</div>';
   }
 
@@ -981,6 +1009,9 @@ function viewOverview(v) {
       var s = S.data.subjects.filter(function (x) { return x.id === a.dataset.goto; })[0];
       S.tab = 'assign'; S.level = String(s.level); S.q = s.code; S.onlyIncomplete = false; render();
     };
+  });
+  each(v, '[data-gotchr]', function (a) {
+    a.onclick = function () { S.tab = 'timetable'; S.ttMode = 'teacher'; S.ttTeacher = a.dataset.gotchr; S.sel = null; render(); window.scrollTo(0, 0); };
   });
 }
 function stat(v, l, cls) { return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) + '</div><div class="l">' + esc(l) + '</div></div>'; }
@@ -1801,7 +1832,7 @@ function undoAuto() {
 }
 
 /* ------------------------------------------------------------ พิมพ์ตาราง */
-var PRINT_DEFAULT = { logo: '', color: '', signLeft: 'รองผอ.ฝ่ายวิชาการ', signRight: 'ผู้อำนวยการโรงเรียน', classRooms: {}, places: ['ห้องคอม', 'ห้องวิทยาศาสตร์', 'ห้องสมุด', 'สนามกีฬา'] };
+var PRINT_DEFAULT = { logo: '', color: '', signLeft: 'รองผอ.ฝ่ายวิชาการ', signRight: 'ผู้อำนวยการโรงเรียน', classRooms: {}, places: ['ห้องคอม', 'ห้องวิทยาศาสตร์', 'ห้องสมุด', 'สนามกีฬา'], alerts: {} };
 function printCfg() {
   var p = S.data.print || {}, out = {};
   Object.keys(PRINT_DEFAULT).forEach(function (k) { out[k] = p[k] === undefined || p[k] === '' ? PRINT_DEFAULT[k] : p[k]; });
@@ -1995,7 +2026,9 @@ function bindPrintSettings(v) {
   $('prReset').onclick = function () { S.prDraft = null; render(); };
   $('prSave').onclick = function () {
     var btn = this; btn.disabled = true;
-    p.places = printCfg().places; // รายการห้องอาจถูกแก้จากแท็บจัดตารางหลังเปิดฟอร์มนี้
+    // รายการห้องและการแจ้งเตือนอาจถูกแก้จากแท็บอื่นหลังเปิดฟอร์มนี้
+    p.places = printCfg().places;
+    p.alerts = printCfg().alerts;
     api('savePrintSettings', p).then(function (res) {
       S.data.print = res.print; S.prDraft = null; toast('บันทึกหัวกระดาษแล้ว'); render();
     }).catch(function (e) { btn.disabled = false; toast('บันทึกไม่สำเร็จ: ' + e, true); });
@@ -2289,6 +2322,10 @@ function viewSettings(v) {
     }).join('') + '</tbody></table></div>' +
     '<div class="toolbar" style="margin-top:12px"><button class="btn primary" data-edit id="newTerm">+ สร้างภาคเรียนใหม่</button></div></div>';
   html += '<div class="panel" id="schedPanel"></div><div class="panel" id="fixedPanel"></div>';
+  html += '<div class="panel"><h2>การแจ้งเตือนในหน้าภาพรวม</h2><p class="muted" style="margin-top:0">เลือกเรื่องที่จะแจ้งในกล่อง "สิ่งที่ต้องตรวจสอบ" และนับในตัวเลขบนเมนู (ใช้ร่วมกันทุกคนและทุกภาคเรียน)</p><div class="au-rules">' +
+    ALERTS.map(function (a) {
+      return '<label><input type="checkbox" data-edit data-alert="' + a.key + '"' + (alertOn(a.key) ? ' checked' : '') + '> ' + esc(a.label) + ' <span class="muted">— ' + esc(a.hint) + '</span></label>';
+    }).join('') + '</div></div>';
   if (d.offline) {
     html += '<div class="panel"><h2>ข้อมูลในเครื่อง</h2><p>เวอร์ชันออฟไลน์เก็บข้อมูลไว้ในเบราว์เซอร์ของเครื่องนี้ ถ้าล้างข้อมูลเบราว์เซอร์ (Clear browsing data) ข้อมูลจะหาย ' +
       '<b>ควรกด "ส่งออกไฟล์สำรอง" เก็บไว้เป็นระยะ</b></p></div>';
@@ -2317,6 +2354,18 @@ function viewSettings(v) {
   });
   $('newTerm').onclick = termForm;
   $('bkExport').onclick = exportBackup;
+  each(v, '[data-alert]', function (cb) {
+    cb.onchange = function () {
+      var p = JSON.parse(JSON.stringify(printCfg()));
+      p.alerts[cb.dataset.alert] = cb.checked;
+      S.pending++;
+      api('savePrintSettings', p).then(function (res) {
+        S.pending--; S.data.print = res.print; toast('บันทึกแล้ว'); render();
+      }).catch(function (e) {
+        S.pending--; cb.checked = !cb.checked; toast('บันทึกไม่สำเร็จ: ' + e, true);
+      });
+    };
+  });
   if ($('fbCopy')) $('fbCopy').onclick = copyFromSheet;
   $('bkImportBtn').onclick = function () { $('bkImport').click(); };
   $('bkImport').onchange = function () { if (this.files[0]) importBackup(this.files[0]); this.value = ''; };
