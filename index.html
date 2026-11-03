@@ -142,6 +142,12 @@ var FIREBASE_CONFIG = {
       var cleared = [];
       db.subjects.forEach(function (s) { ['room1', 'room2', 'room3'].forEach(function (k) { if (s[k] === id) { s[k] = ''; cleared.push(s.id); } }); });
       db.teachers = db.teachers.filter(function (x) { return x.id !== id; });
+      // เอาครูออกจากกิจกรรมที่เลือกรายคน ถ้าไม่เหลือใครก็ลบกิจกรรมนั้น
+      db.fixed = db.fixed.filter(function (f) {
+        if (f.level !== -2) return true;
+        f.teacherIds = (f.teacherIds || []).filter(function (x) { return x !== id; });
+        return f.teacherIds.length > 0;
+      });
       return { ok: true, cleared: cleared };
     },
     createTerm: function (o) {
@@ -159,7 +165,9 @@ var FIREBASE_CONFIG = {
       if (o.copyFrom) {
         if (db.schedules[o.copyFrom]) db.schedules[o.id] = copy(db.schedules[o.copyFrom]);
         db.fixed.filter(function (f) { return f.termId === o.copyFrom; }).forEach(function (f) {
-          var n = copy(f); n.id = rid('F'); n.termId = o.id; db.fixed.push(n);
+          var n = copy(f); n.id = rid('F'); n.termId = o.id;
+          if (n.teacherIds) n.teacherIds = n.teacherIds.map(function (id) { return map[id]; }).filter(Boolean);
+          db.fixed.push(n);
         });
       }
       return { ok: true, teachers: nt, subjects: ns };
@@ -176,9 +184,14 @@ var FIREBASE_CONFIG = {
     saveFixed: function (f) {
       var rows = [], skipped = 0;
       f.days.forEach(function (day) {
-        var dup = db.fixed.some(function (x) { return x.termId === f.termId && x.day === day && x.period === f.period && x.level === f.level && x.room === f.room; });
+        var dup = db.fixed.some(function (x) {
+          return x.termId === f.termId && x.day === day && x.period === f.period && x.level === f.level && x.room === f.room &&
+            String(x.teacherIds || '') === String(f.teacherIds || '') && String(x.classes || '') === String(f.classes || '');
+        });
         if (dup) { skipped++; return; }
         var row = { id: rid('F'), termId: f.termId, day: day, period: f.period, level: f.level, room: f.room, label: f.label, updatedAt: now() };
+        if (f.level === -2) row.teacherIds = copy(f.teacherIds);
+        if (f.level === -3) row.classes = copy(f.classes);
         db.fixed.push(row); rows.push(copy(row));
       });
       return { rows: rows, skipped: skipped };
@@ -192,7 +205,9 @@ var FIREBASE_CONFIG = {
       var nClass = sched.periods.filter(function (p) { return p.type === 'class'; }).length;
       if (sched.days.indexOf(l.day) < 0 || !(l.period >= 1 && l.period <= nClass)) throw new Error('ช่องนี้อยู่นอกวัน/คาบเรียนที่ตั้งไว้');
       var fx = db.fixed.filter(function (f) {
-        return f.termId === l.termId && f.day === l.day && f.period === l.period && (!f.level || (f.level === subj.level && (!f.room || f.room === l.room)));
+        if (f.termId !== l.termId || f.day !== l.day || f.period !== l.period) return false;
+        if (f.level === -3) return (f.classes || []).indexOf(subj.level + '/' + l.room) >= 0;
+        return !f.level || (f.level === subj.level && (!f.room || f.room === l.room));
       })[0];
       if (fx) throw new Error('ช่องนี้ล็อกไว้สำหรับ ' + fx.label);
       var taken = db.timetable.filter(function (x) {
@@ -514,6 +529,7 @@ var FIREBASE_CONFIG = {
   .report tr.total td { font-weight: 700; }
 
   /* คาบเรียน / ตารางสอน */
+  .toolbar[hidden] { display: none; }
   .daypick { display: flex; gap: 6px; flex-wrap: wrap; }
   .daypick label { border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; cursor: pointer; background: #fff; }
   .daypick label.on { background: var(--brand-soft); border-color: var(--brand); color: var(--brand); }
@@ -1151,7 +1167,16 @@ function placeOf(sid, room) {
   return l ? l.place : '';
 }
 function teacherOf(s, room) { return s['room' + room] || ''; }
-function fixedApplies(f, level, room) { return !f.level || (f.level === level && (!f.room || f.room === room)); }
+/** กลุ่มเป้าหมายของกิจกรรม (f.level): 0 = ทุกชั้น, 1-6 = ชั้น/ห้อง, -1 = ครูทุกคน, -2 = ครูที่เลือก (f.teacherIds), -3 = ห้องที่เลือก (f.classes) */
+function fixedApplies(f, level, room) {
+  if (f.level === -3) return (f.classes || []).indexOf(level + '/' + room) >= 0;
+  return !f.level || (f.level === level && (!f.room || f.room === room));
+}
+/** กิจกรรมนี้ขึ้นในตารางสอนของครู tid ไหม */
+function fixedForTeacher(f, tid) {
+  if (f.level === -2) return (f.teacherIds || []).indexOf(tid) >= 0;
+  return f.level === 0 || f.level === -1;
+}
 function slotKey(day, period) { return day + '-' + period; }
 
 /** ดัชนีของตารางทั้งภาคเรียน: ช่องของแต่ละห้อง, ช่องของแต่ละครู, จำนวนคาบที่ลงแล้ว และรายการที่มีปัญหา */
@@ -1254,7 +1279,7 @@ function slotCheck(ix, s, room, day, period, moveIds) {
   var tid = teacherOf(s, room);
   var busy = tid ? (ix.byTeacher[tid + '@' + slotKey(day, period)] || []).filter(notMoving) : [];
   if (busy.length) return { level: 'warn', why: shortName(teacherMap()[tid]) + ' สอน ' + busy[0].s.code + ' ม.' + busy[0].level + '/' + busy[0].room + ' ในคาบนี้อยู่แล้ว' };
-  var tfx = fixedOf().filter(function (f) { return f.level < 0 && f.day === day && f.period === period; })[0];
+  var tfx = fixedOf().filter(function (f) { return (f.level === -1 || f.level === -2) && f.day === day && f.period === period && fixedForTeacher(f, tid); })[0];
   if (tid && tfx) return { level: 'warn', why: 'คาบนี้ครูมีกิจกรรม ' + tfx.label };
   return { level: 'ok', why: 'วางได้' };
 }
@@ -1323,7 +1348,7 @@ function viewTimetable(v) {
     fixedOf().forEach(function (f) {
       if (f.day !== day || f.period !== no) return;
       var c = S.ttClass.split('/').map(Number);
-      if (isT ? f.level <= 0 : fixedApplies(f, c[0], c[1])) out += '<div class="fx">' + esc(f.label) + '</div>';
+      if (isT ? fixedForTeacher(f, S.ttTeacher) : fixedApplies(f, c[0], c[1])) out += '<div class="fx">' + esc(f.label) + '</div>';
     });
     var list = isT ? ix.byTeacher[S.ttTeacher + '@' + slotKey(day, no)] : ix.cell[S.ttClass + '@' + slotKey(day, no)];
     (list || []).forEach(function (x) {
@@ -1585,7 +1610,8 @@ function autoPlan(opts) {
   var cls = classes();
   fixedOf().forEach(function (f) {
     var k = slotKey(f.day, f.period);
-    if (f.level < 0) { base.tFixed[k] = f.label; return; }
+    if (f.level === -1) { base.tFixed[k] = f.label; return; }
+    if (f.level === -2) { (f.teacherIds || []).forEach(function (tid) { base.tFixed[tid + '@' + k] = f.label; }); return; }
     cls.forEach(function (c) { if (fixedApplies(f, c.level, c.room)) base.fixedC[c.key + '@' + k] = f.label; });
   });
   // ภาระทั้งหมดของครู (ใช้เรียงลำดับ: ครูที่สอนเยอะวางก่อน)
@@ -1600,7 +1626,7 @@ function autoPlan(opts) {
       for (var i = 0; i < u.clsList.length; i++) {
         if (st.fixedC[u.clsList[i] + '@' + k] || st.cb[u.clsList[i] + '@' + k]) return false;
       }
-      if (u.tid && (st.tb[u.tid + '@' + k] || st.tFixed[k])) return false;
+      if (u.tid && (st.tb[u.tid + '@' + k] || st.tFixed[k] || st.tFixed[u.tid + '@' + k])) return false;
     }
     return true;
   }
@@ -1646,7 +1672,7 @@ function autoPlan(opts) {
     tries.sort(function (a, b) { return a.r - b.r; });
     for (var i = 0; i < tries.length; i++) {
       var t = tries[i], k = slotKey(t.day, t.p);
-      if (st.fixedC[c + '@' + k] || (u.tid && st.tFixed[k])) continue;
+      if (st.fixedC[c + '@' + k] || (u.tid && (st.tFixed[k] || st.tFixed[u.tid + '@' + k]))) continue;
       var bc = st.cb[c + '@' + k], bt = u.tid ? st.tb[u.tid + '@' + k] : null;
       var blockers = [bc, bt].filter(function (b, j, a) { return b && a.indexOf(b) === j; });
       if (blockers.length !== 1 || blockers[0] === 'fixed' || blockers[0].len !== 1 || blockers[0].clsList.length !== 1) continue;
@@ -1887,7 +1913,7 @@ function teacherSheetData(t, ix) {
         g.forEach(function (x) { e.rooms[x.room] = (e.rooms[x.room] || 0) + 1; });
       });
       fixedOf().forEach(function (f) {
-        if (f.day !== day || f.period !== no || f.level > 0) return;
+        if (f.day !== day || f.period !== no || !fixedForTeacher(f, t.id)) return;
         items.push([f.label]);
         act[f.label] = (act[f.label] || 0) + 1;
       });
@@ -2421,7 +2447,14 @@ function slots(sch) {
 function classCount(sch) { return sch.periods.filter(function (p) { return p.type === 'class'; }).length; }
 function fixedOf() { return S.data.fixed.filter(function (f) { return f.termId === S.termId; }); }
 function lessonsOf() { return S.data.timetable.filter(function (l) { return l.termId === S.termId; }); }
-function scopeLabel(f) { return f.level < 0 ? 'ครูทุกคน' : !f.level ? 'ทุกชั้น' : 'ม.' + f.level + (f.room ? '/' + f.room : ' ทุกห้อง'); }
+function scopeLabel(f) {
+  if (f.level === -2) {
+    var tm = teacherMap(), names = (f.teacherIds || []).map(function (id) { return tm[id] ? shortName(tm[id]) : '(ครูที่ถูกลบ)'; });
+    return 'ครู ' + names.length + ' คน: ' + names.join(', ');
+  }
+  if (f.level === -3) return (f.classes || []).map(function (c) { return 'ม.' + c; }).join(', ');
+  return f.level < 0 ? 'ครูทุกคน' : !f.level ? 'ทุกชั้น' : 'ม.' + f.level + (f.room ? '/' + f.room : ' ทุกห้อง');
+}
 function outside(x, sch) { return sch.days.indexOf(x.day) < 0 || x.period > classCount(sch); }
 function toMin(t) { var m = /^(\d{1,2})[:.](\d{2})$/.exec(t || ''); return m ? Number(m[1]) * 60 + Number(m[2]) : NaN; }
 function fromMin(m) { m = ((m % 1440) + 1440) % 1440; return ('0' + Math.floor(m / 60)).slice(-2) + ':' + ('0' + m % 60).slice(-2); }
@@ -2587,11 +2620,19 @@ function renderFixedPanel() {
     }).join('') + '</div></div><div class="toolbar">' +
     '<label>คาบที่ <select data-edit id="fxPeriod">' + Array.apply(null, Array(n)).map(function (_, i) { return '<option value="' + (i + 1) + '">' + (i + 1) + '</option>'; }).join('') + '</select></label>' +
     '<label>ใช้กับ <select data-edit id="fxLevel"><option value="0">ทุกชั้น</option>' + [1, 2, 3, 4, 5, 6].map(function (l) { return '<option value="' + l + '">ม.' + l + '</option>'; }).join('') +
-    '<option value="-1">ครูทุกคน (เช่น PLC — ไม่ล็อกตารางเรียน)</option></select></label>' +
+    '<option value="-3">เลือกหลายห้อง…</option>' +
+    '<option value="-1">ครูทุกคน (เช่น PLC — ไม่ล็อกตารางเรียน)</option>' +
+    '<option value="-2">เลือกครูรายคน… (ไม่ล็อกตารางเรียน)</option></select></label>' +
     '<label>ห้อง <select data-edit id="fxRoom" disabled><option value="0">ทุกห้อง</option><option value="1">/1</option><option value="2">/2</option><option value="3">/3</option></select></label>' +
     '<input type="text" data-edit id="fxLabel" list="acts" placeholder="ชื่อกิจกรรม" style="flex:1;min-width:180px"><datalist id="acts">' +
     ACTIVITIES.map(function (a) { return '<option>' + esc(a) + '</option>'; }).join('') + '</datalist>' +
-    '<button class="btn primary" data-edit id="fxAdd">+ ล็อกช่อง</button></div>';
+    '<button class="btn primary" data-edit id="fxAdd">+ ล็อกช่อง</button></div>' +
+    '<div class="toolbar" id="fxTeachers" hidden><b>ครู</b><div class="daypick">' + teachers().map(function (t) {
+      return '<label><input type="checkbox" data-edit data-ftid="' + esc(t.id) + '">' + esc(shortName(t)) + '</label>';
+    }).join('') + '</div></div>' +
+    '<div class="toolbar" id="fxClasses" hidden><b>ห้อง</b><div class="daypick">' + classes().map(function (c) {
+      return '<label><input type="checkbox" data-edit data-fcls="' + c.key + '">ม.' + c.key + '</label>';
+    }).join('') + '</div></div>';
   html += '<div class="scroll"><table><thead><tr><th>วัน</th><th class="num">คาบที่</th><th>ใช้กับ</th><th>กิจกรรม</th><th></th></tr></thead><tbody>' +
     (list.map(function (f) {
       var out = outside(f, sch);
@@ -2600,14 +2641,29 @@ function renderFixedPanel() {
     }).join('') || '<tr><td colspan="5" class="muted">ยังไม่มีช่องที่ล็อกไว้</td></tr>') + '</tbody></table></div>';
   el.innerHTML = html;
 
-  each(el, '[data-fday]', function (cb) { cb.onchange = function () { cb.parentNode.classList.toggle('on', cb.checked); }; });
-  $('fxLevel').onchange = function () { var r = $('fxRoom'); r.disabled = Number(this.value) < 1; if (r.disabled) r.value = '0'; };
+  each(el, '[data-fday],[data-ftid],[data-fcls]', function (cb) { cb.onchange = function () { cb.parentNode.classList.toggle('on', cb.checked); }; });
+  $('fxLevel').onchange = function () {
+    var r = $('fxRoom'), lv = Number(this.value);
+    r.disabled = lv < 1; if (r.disabled) r.value = '0';
+    $('fxTeachers').hidden = lv !== -2;
+    $('fxClasses').hidden = lv !== -3;
+  };
   $('fxAdd').onclick = function () {
     var days = [];
     each(el, '[data-fday]', function (cb) { if (cb.checked) days.push(Number(cb.dataset.fday)); });
     var f = { termId: S.termId, days: days, period: Number($('fxPeriod').value), level: Number($('fxLevel').value), room: Number($('fxRoom').value), label: $('fxLabel').value.trim() };
     if (!days.length) return toast('กรุณาเลือกวันอย่างน้อย 1 วัน', true);
     if (!f.label) return toast('กรุณากรอกชื่อกิจกรรม', true);
+    if (f.level === -2) {
+      f.teacherIds = [];
+      each(el, '[data-ftid]', function (cb) { if (cb.checked) f.teacherIds.push(cb.dataset.ftid); });
+      if (!f.teacherIds.length) return toast('กรุณาเลือกครูอย่างน้อย 1 คน', true);
+    }
+    if (f.level === -3) {
+      f.classes = [];
+      each(el, '[data-fcls]', function (cb) { if (cb.checked) f.classes.push(cb.dataset.fcls); });
+      if (!f.classes.length) return toast('กรุณาเลือกห้องอย่างน้อย 1 ห้อง', true);
+    }
     var btn = this; btn.disabled = true;
     api('saveFixed', f).then(function (res) {
       S.data.fixed = S.data.fixed.concat(res.rows);
